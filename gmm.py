@@ -1,4 +1,47 @@
 import torch
+from torch import nn
+from torch.utils.data import DataLoader
+import numpy as np
+import os
+from scipy.stats import multivariate_normal
+
+
+class GMMDataset(torch.utils.data.Dataset):
+    def __init__(self, n_samples, n_features=2, n_classes=3, random_seed=42):
+        np.random.seed(random_seed)
+        self.n_samples = n_samples
+        self.n_features = n_features
+        self.n_classes = n_classes
+
+        self.means = np.random.uniform(-5, 5, size=(n_classes, n_features))
+        self.covariances = np.array([np.eye(n_features) for _ in range(n_classes)])
+        self.weights = np.random.dirichlet([1] * n_classes)
+
+        self.x = []
+        self.y = []
+        for _ in range(n_samples):
+            component = np.random.choice(n_classes, p=self.weights)
+            sample = np.random.multivariate_normal(
+                self.means[component], self.covariances[component]
+            )
+            self.x.append(sample)
+            self.y.append(component)
+
+        self.x = torch.tensor(self.x, dtype=torch.float32)
+        self.y = torch.tensor(self.y, dtype=torch.long)
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+train_dataset = GMMDataset(n_samples=50000, n_features=10, n_classes=6)
+test_dataset = GMMDataset(n_samples=2000, n_features=10, n_classes=6)
+
+
+test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
 
 @torch.no_grad()
@@ -39,16 +82,12 @@ def get_mutual_info(model):
                 ] += 1
 
             # now, for each x, we increment the corresponding entry
-            def bin_to_base10(bits):
-                return sum([2**i for i, b in enumerate(bits) if b == 1])
-
             for i in range(output.size(0)):
                 current_x = (
                     current_xs[i].cpu().numpy().tolist()
                 )  # binary repr of x (between 0 and 1024)
-                current_x_base10 = bin_to_base10(current_x)
                 hidden_layer_stats[layer]["hist_tandx"][
-                    tuple(li[i]) + (current_x_base10,)
+                    tuple(li[i]) + (tuple(current_x),)
                 ] += 1
 
     for layer in model:
@@ -79,24 +118,34 @@ def get_mutual_info(model):
         for k in info["p_tandx"]:
             info["p_tandx"][k] /= total_observations
 
-    # now we can compute the mutual information
-    # I(T; Y) = sum_t sum_y p(t, y) log(p(t, y) / (p(t)p(y)))
-    # p(y) = 0.5
-    # I(T; X) = sum_t sum_x p(t, x) log(p(t, x) / (p(t)p(x)))
-    # p(x) = 1 / 1024
+    gmm_weights = train_dataset.weights
+    gmm_means = train_dataset.means
+    gmm_covs = train_dataset.covariances
+
+    def compute_px(x):
+        """Compute p(x) for a given x using the GMM parameters."""
+        px = 0
+        for weight, mean, cov in zip(gmm_weights, gmm_means, gmm_covs):
+            px += weight * multivariate_normal.pdf(x, mean, cov)
+        return px
+
     mis_y = dict()
     mis_x = dict()
     for layer, info in hidden_layer_stats.items():
         mi = 0
         for k, v in info["p_tandy"].items():
             t = k[:-1]
-            mi += v * math.log(v / (info["p_t"][t] * 0.5))
+            y = k[-1]
+            py = gmm_weights[y]  # p(y) from GMM
+            mi += v * math.log(v / (info["p_t"][t] * py))
         mis_y[layer] = mi
 
         mi = 0
         for k, v in info["p_tandx"].items():
             t = k[:-1]
-            mi += v * math.log(v / (info["p_t"][t] * (1 / 1024)))
+            x = np.array(k[-1])
+            px = compute_px(x)  # p(x) from GMM
+            mi += v * math.log(v / (info["p_t"][t] * px))
         mis_x[layer] = mi
 
     for layer in model:
@@ -112,60 +161,7 @@ def print_mi(model):
         layer_key = list(mi_y[0].state_dict().keys())[0]
         print(f"{layer_key}: I(T; Y)={mi_y[1]}, I(T; X)={mi_x[1]}")
 
-
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import transforms
-
-transform = transforms.ToTensor()
-
-
-def tensor_to_binary(t: torch.Tensor) -> torch.Tensor:
-    return ((t.unsqueeze(-1) & (1 << torch.arange(9, -1, -1))) > 0).int()
-
-
-tensor_to_binary_batched = torch.vmap(tensor_to_binary)
-
-
-def generate_dataset(n):
-    ngroups = 4
-    group_labels = torch.zeros(ngroups)
-    # half groups are 0, half are 1, randomly
-    group_labels[torch.randint(0, ngroups, (ngroups // 2,))] = 1
-
-    x = torch.randint(0, 1024, (n,))
-    y = torch.zeros(n)
-
-    # y is 1 if x is in a group with label 1
-    for i in range(n):
-        groupn = x[i] // (1024 // ngroups)
-        y[i] = group_labels[groupn]
-
-    # x as binary
-    x = tensor_to_binary_batched(x)
-
-    return x.float(), y.long()
-
-
-class BinaryDataset(torch.utils.data.Dataset):
-    def __init__(self, n):
-        self.n = n
-        self.x, self.y = generate_dataset(n)
-        self.x = self.x.float()
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
-
-
-train_dataset = BinaryDataset(50000)
-test_dataset = BinaryDataset(10000)
-
-train_loader = DataLoader(train_dataset, batch_size=10000, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=10000, shuffle=False)
+    return mis_y, mis_x
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -184,18 +180,21 @@ class LinearAndActivation(nn.Module):
 ident = lambda x: x
 model = nn.Sequential(
     nn.Flatten(),
-    LinearAndActivation(10, 8, nn.Tanh()),
-    LinearAndActivation(8, 6, nn.Tanh()),
-    LinearAndActivation(6, 2, ident),
+    LinearAndActivation(train_dataset.n_features, 5, nn.Tanh()),
+    LinearAndActivation(5, 3, nn.Tanh()),
+    LinearAndActivation(3, train_dataset.n_classes, ident),
 ).to(device)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 loss_fn = nn.CrossEntropyLoss()
 
-for epoch in range(1000):
-    if epoch % 10 == 0:
+# Training loop with mutual information computation
+mis = []
+
+for epoch in range(500):
+    if epoch % 5 == 0:
         print("Before epoch", epoch)
-        print_mi(model)
+        mis.append(print_mi(model))
         with torch.no_grad():
             total = 0
             correct = 0
@@ -206,13 +205,37 @@ for epoch in range(1000):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
             print(f"Epoch {epoch}: Accuracy {correct / total}")
-    for images, labels in train_loader:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        output = model(images)
-        loss = loss_fn(output, labels)
-        loss.backward()
-        optimizer.step()
+
+    images, labels = next(
+        iter(DataLoader(train_dataset, batch_size=100, shuffle=True))
+    )  # random batch
+    images, labels = images.to(device), labels.to(device)
+    optimizer.zero_grad()
+    output = model(images)
+    loss = loss_fn(output, labels)
+    loss.backward()
+    optimizer.step()
+
+print("Saving mutual informations along training")
+mis2 = []
 
 
-print_mi(model)
+def flatten(lis):
+    res = []
+    for l in lis:
+        if isinstance(l, (list, tuple)):
+            res.extend(flatten(l))
+        else:
+            res.append(l)
+    return res
+
+
+for mis_y, mis_x in mis:
+    mis2.append(flatten([*zip(list(mis_y.values()), list(mis_x.values()))]))
+
+npmat = np.array(mis2)
+
+if os.path.exists("mis.csv"):
+    os.remove("mis.csv")
+np.savetxt("mis.csv", npmat, delimiter=",")
+print("Done")
