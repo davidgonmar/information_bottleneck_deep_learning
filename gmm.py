@@ -182,10 +182,10 @@ model = nn.Sequential(
     nn.Flatten(),
     LinearAndActivation(train_dataset.n_features, 5, nn.Tanh()),
     LinearAndActivation(5, 3, nn.Tanh()),
-    LinearAndActivation(3, train_dataset.n_classes, ident),
+    LinearAndActivation(3, train_dataset.n_classes, nn.Softmax(dim=1)),
 ).to(device)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 loss_fn = nn.CrossEntropyLoss()
 
 # Training loop with mutual information computation
