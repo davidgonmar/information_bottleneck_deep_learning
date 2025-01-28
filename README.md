@@ -1,0 +1,1 @@
+- [Deep Learning and the Information Bottleneck Principle](https://arxiv.org/abs/1503.02406) 
