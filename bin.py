@@ -197,13 +197,13 @@ model = nn.Sequential(
     LinearAndActivation(4, train_dataset.n_classes, ident),
 ).to(device)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 loss_fn = nn.CrossEntropyLoss()
 
 
 mis = []
 
-for epoch in range(4000):
+for epoch in range(800):
     if epoch % 5 == 0:
         print("Before epoch", epoch)
         mis.append(print_mi(model))
