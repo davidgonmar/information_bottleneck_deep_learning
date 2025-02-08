@@ -3,6 +3,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 import numpy as np
 import os
+from ib import get_mutual_info
+import argparse
 
 
 def tensor_to_binary(t: torch.Tensor) -> torch.Tensor:
@@ -12,6 +14,19 @@ def tensor_to_binary(t: torch.Tensor) -> torch.Tensor:
 
 
 tensor_to_binary_batched = torch.vmap(tensor_to_binary)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--activation", type=str, default="tanh")
+args = parser.parse_args()
+
+torch.manual_seed(42)
+ACTIVATION_TO_BIN_CONFIG = {
+    "tanh": (-1, 1, 30),
+    "relu": (0, 1, 30),
+    "sigmoid": (0, 1, 30),
+    "identity": (-1, 1, 30),
+    "softmax": (0, 1, 30),
+}
 
 
 def generate_dataset(n, group_labels, max_int=4096):
@@ -38,7 +53,7 @@ class BinaryDataset(torch.utils.data.Dataset):
     def __init__(self, n, group_labels, max_int=4096):
         self.n = n
         self.x, self.y = generate_dataset(n, group_labels, max_int)
-        self.n_features = self.x.size(1)
+        self.n_features: int = self.x.size(1)
         self.n_classes = 2
 
     def __len__(self):
@@ -69,105 +84,32 @@ train_loader = DataLoader(train_dataset, batch_size=50000, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=10000, shuffle=False)
 
 
-@torch.no_grad()
-def get_mutual_info(model):
-    # each layer out will be digitized using 30 bins between -1 and 1
-    from collections import Counter
-    import numpy as np
+p_y = lambda y: 1 / 2
+p_x = lambda x: 1 / (2**12)
 
-    current_labels = None
-    current_xs = None
-    hidden_layer_stats = {}
-    import math
 
-    for layer in model:
-        if isinstance(layer, LinearAndActivation):
-            hidden_layer_stats[layer] = {
-                "hist_t": Counter(),
-                "hist_tandy": Counter(),
-                "hist_tandx": Counter(),
-            }
+def get_bin_config(layer):
+    assert isinstance(layer, LinearAndActivation)
+    if isinstance(layer.activation, nn.Tanh):
+        return ACTIVATION_TO_BIN_CONFIG["tanh"]
+    elif isinstance(layer.activation, nn.ReLU):
+        return ACTIVATION_TO_BIN_CONFIG["relu"]
+    elif isinstance(layer.activation, nn.Sigmoid):
+        return ACTIVATION_TO_BIN_CONFIG["sigmoid"]
+    elif isinstance(layer.activation, nn.Identity):
+        return ACTIVATION_TO_BIN_CONFIG["identity"]
+    elif isinstance(layer.activation, nn.Softmax):
+        return ACTIVATION_TO_BIN_CONFIG["softmax"]
+    elif isinstance(layer.activation, nn.LogSoftmax):
+        return ACTIVATION_TO_BIN_CONFIG["softmax"]
 
-    def append_stats(layer, input, output):
-        nonlocal current_labels
-        nonlocal current_xs
-        if isinstance(layer, LinearAndActivation):
-            # output has shape (batch_size, out_features)
-            # each el of output (of shape out_features)
-            # digitized into 30 bins
-            digitized = np.digitize(output.cpu().numpy(), np.linspace(-1, 1, 30))
-            li = digitized.tolist()
-            for ll in li:
-                hidden_layer_stats[layer]["hist_t"][tuple(ll)] += 1
-
-            # now, for each label, we increment the corresponding entry
-            for i in range(output.size(0)):
-                hidden_layer_stats[layer]["hist_tandy"][
-                    tuple(li[i]) + (current_labels[i].item(),)
-                ] += 1
-
-            # now, for each x, we increment the corresponding entry
-            for i in range(output.size(0)):
-                current_x = (
-                    current_xs[i].cpu().numpy().tolist()
-                )  # binary repr of x (between 0 and 1024)
-                hidden_layer_stats[layer]["hist_tandx"][
-                    tuple(li[i]) + (tuple(current_x),)
-                ] += 1
-
-    for layer in model:
-        # clear all hooks
-        layer._forward_hooks.clear()
-        layer.register_forward_hook(append_stats)
-
-    with torch.no_grad():
-        for images, labels in test_loader:
-            current_labels = labels
-            current_xs = images
-            images, labels = images.to(device), labels.to(device)
-            model(images)
-
-    # count total observations
-    total_observations = sum(hidden_layer_stats[model[1]]["hist_t"].values())
-
-    for layer, info in hidden_layer_stats.items():
-        info["p_t"] = info["hist_t"].copy()
-        for k in info["p_t"]:
-            info["p_t"][k] /= total_observations
-
-        info["p_tandy"] = info["hist_tandy"].copy()
-        for k in info["p_tandy"]:
-            info["p_tandy"][k] /= total_observations
-
-        info["p_tandx"] = info["hist_tandx"].copy()
-        for k in info["p_tandx"]:
-            info["p_tandx"][k] /= total_observations
-
-    mis_y = dict()
-    mis_x = dict()
-    for layer, info in hidden_layer_stats.items():
-        mi = 0
-        for k, v in info["p_tandy"].items():
-            t = k[:-1]
-            py = 1 / train_dataset.n_classes
-            mi += v * math.log(v / (info["p_t"][t] * py))
-        mis_y[layer] = mi
-
-        mi = 0
-        for k, v in info["p_tandx"].items():
-            t = k[:-1]
-            px = 1 / (2**train_dataset.n_features)
-            mi += v * math.log(v / (info["p_t"][t] * px))
-        mis_x[layer] = mi
-
-    for layer in model:
-        layer._forward_hooks.clear()
-
-    return mis_y, mis_x
+    raise ValueError("Activation not supported: ", layer.activation)
 
 
 def print_mi(model):
-    mis_y, mis_x = get_mutual_info(model)
+    mis_y, mis_x = get_mutual_info(
+        model, test_loader, [LinearAndActivation], p_x, p_y, get_bin_config
+    )
     # print layer name, mi(T; Y), mi(T; X)
     for mi_y, mi_x in zip(mis_y.items(), mis_x.items()):
         layer_key = list(mi_y[0].state_dict().keys())[0]
@@ -189,22 +131,29 @@ class LinearAndActivation(nn.Module):
         return self.activation(self.linear(x))
 
 
-ident = lambda x: x
+act = {
+    "tanh": nn.Tanh(),
+    "relu": nn.ReLU(),
+    "sigmoid": nn.Sigmoid(),
+    "identity": nn.Identity(),
+}[args.activation]
+
 model = nn.Sequential(
     nn.Flatten(),
-    LinearAndActivation(train_dataset.n_features, 6, nn.Tanh()),
-    LinearAndActivation(6, 4, nn.Tanh()),
-    LinearAndActivation(4, train_dataset.n_classes, ident),
+    LinearAndActivation(train_dataset.n_features, 8, act),
+    LinearAndActivation(8, 6, act),
+    LinearAndActivation(6, 4, act),
+    LinearAndActivation(4, train_dataset.n_classes, nn.Softmax(dim=1)),
 ).to(device)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+loss_fn = nn.NLLLoss()
 
 
 mis = []
 
-for epoch in range(800):
-    if epoch % 5 == 0:
+for epoch in range(2000):
+    if epoch % 10 == 0:
         print("Before epoch", epoch)
         mis.append(print_mi(model))
         with torch.no_grad():
@@ -218,12 +167,11 @@ for epoch in range(800):
                 correct += (predicted == labels).sum().item()
             print(f"Epoch {epoch}: Accuracy {correct / total}")
 
-    images, labels = next(
-        iter(DataLoader(train_dataset, batch_size=100, shuffle=True))
-    )  # random batch
+    idxs = torch.randint(0, len(train_dataset), (1000,))
+    images, labels = train_dataset[idxs]
     images, labels = images.to(device), labels.to(device)
     optimizer.zero_grad()
-    output = model(images)
+    output = torch.log(model(images))  # log softmax
     loss = loss_fn(output, labels)
     loss.backward()
     optimizer.step()
